@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import typing as t
 from collections.abc import Callable
 from functools import cached_property
@@ -12,6 +11,7 @@ import requests
 from singer_sdk import typing as th
 from singer_sdk.authenticators import BearerTokenAuthenticator
 from singer_sdk.streams import RESTStream
+from singer_sdk.streams.core import REPLICATION_FULL_TABLE
 
 from tap_hubspot.auth import HubSpotOAuthAuthenticator
 
@@ -85,7 +85,8 @@ class HubspotStream(RESTStream):
 
     def _get_paging_after(self, response: requests.Response) -> str | None:
         """Return the `paging.next.after` cursor, or None on the last page."""
-        return (response.json().get("paging") or {}).get("next", {}).get("after")
+        paging = response.json().get("paging") or {}
+        return (paging.get("next") or {}).get("after")
 
     def get_next_page_token(
         self,
@@ -190,8 +191,8 @@ class DynamicHubspotStream(HubspotStream):
         """Return a dictionary of values to be used in URL parameterization.
 
         Note: objects with many properties produce a query string too long for
-        HubSpot (HTTP 431). Prefer the search endpoint, see
-        `DynamicIncrementalHubspotStream`.
+        HubSpot (HTTP 431). Streams with an `incremental_path` use the search
+        endpoint instead, see `DynamicIncrementalHubspotStream`.
 
         Args:
             context: The stream context.
@@ -213,28 +214,61 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
     JSON body, so it is used for every sync (incremental or full) to avoid
     HTTP 431 errors caused by long `properties` query strings.
 
-    Search results are capped at 10k per query. When the cap is reached, the
-    query is restarted with the `GTE` filter moved to the replication key value
-    of the last record seen. Records sharing that boundary value are emitted
-    again (duplicates on `id` are expected).
+    Search results are capped at 10k per query and only one sort is allowed, so
+    the sync runs as a sequence of scans:
 
-    Pagination tokens are dicts: `{"after": <str | None>, "since": <ms | None>}`.
+    - `id`: full scan sorted by `hs_object_id`, used for full-table syncs and for
+      the first sync without state or start_date (includes records whose
+      replication key is empty). At the cap, restarts with `hs_object_id GT`.
+    - `key`: incremental scan sorted by the replication key, starting at the
+      bookmark (`GTE`). At the cap, switches to a `tie` scan on the replication
+      key value of the last record seen.
+    - `tie`: scan of the records sharing that value, sorted by `hs_object_id`.
+      When done, the `key` scan resumes with `GT` the tie value. Records with
+      the tie value are emitted again (duplicates on `id` are expected).
+
+    Pagination tokens are dicts:
+    `{"phase": "id" | "key" | "tie", "value": <ms | None>, "last_id": <int | None>,
+    "strict": <bool>, "after": <str | None>}`.
     """
 
     incremental_path: str | None = None
+    _initial_search_token: SearchToken | None = None
 
     @property
     def _use_search(self) -> bool:
-        return bool(self.incremental_path and self.replication_key)
+        return bool(self.incremental_path)
 
-    def _get_search_start_ms(self, context: Context | None) -> int:
-        """Return the search lower bound: state, then start_date, then epoch 0."""
-        start = self.get_starting_replication_key_value(context)
-        return _to_epoch_ms(start) if start else 0
+    @property
+    def _is_full_table(self) -> bool:
+        # Also covers a catalog that clears `replication_key`
+        return (
+            not self.replication_key
+            or self.replication_method == REPLICATION_FULL_TABLE
+        )
 
-    def _get_record_replication_value(self, record: dict) -> str | None:
-        props = record.get("properties") or {}
-        return props.get(self.replication_key) or record.get("updatedAt")
+    def _initial_token(self, context: Context | None) -> SearchToken:
+        """Return the first search token: `key` scan from the bookmark, else `id`."""
+        start = (
+            None
+            if self._is_full_table
+            else self.get_starting_replication_key_value(context)
+        )
+        if not start:
+            return _search_token("id")
+        return _search_token("key", value=_to_epoch_ms(start))
+
+    def _get_record_replication_ms(self, record: dict) -> int:
+        value = (record.get("properties") or {}).get(self.replication_key)
+        if not value:
+            # Cannot happen: `key` scans filter on the replication key
+            msg = (
+                f"Cannot continue {self.name} past {SEARCH_RESULTS_LIMIT} search "
+                f"results: record {record.get('id')} has no "
+                f"'{self.replication_key}' value."
+            )
+            raise RuntimeError(msg)
+        return _to_epoch_ms(value)
 
     def get_url_params(
         self,
@@ -259,49 +293,44 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
         response: requests.Response,
         previous_token: PageToken,
     ) -> PageToken:
-        """Return the next search page token, restarting the query at the 10k cap."""
+        """Return the next search token, moving to the next scan at the 10k cap."""
         after = self._get_paging_after(response)
-        if not self._use_search or not after:
+        if not self._use_search:
             return after
 
-        if int(after) + SEARCH_PAGE_SIZE < SEARCH_RESULTS_LIMIT:
-            since = (
-                previous_token.get("since")
-                if isinstance(previous_token, dict)
-                else None
-            )
-            return {"after": after, "since": since}
-
-        # Restart the query from the last replication key value seen.
-        records = list(self.parse_response(response))
-        last_value = (
-            self._get_record_replication_value(records[-1]) if records else None
+        token = (
+            previous_token
+            if isinstance(previous_token, dict)
+            else self._initial_search_token
         )
-        if not last_value:
-            msg = (
-                f"Cannot continue {self.name} past {SEARCH_RESULTS_LIMIT} search "
-                f"results: last record has no '{self.replication_key}' value."
-            )
+        if token is None:
+            msg = "Search token is missing: no search request was prepared."
             raise RuntimeError(msg)
 
-        sent_body = json.loads(t.cast("bytes", response.request.body))
-        current_since = int(sent_body["filterGroups"][0]["filters"][0]["value"])
-        next_since = _to_epoch_ms(last_value)
-        if next_since <= current_since:
-            msg = (
-                f"Cannot continue {self.name} past {SEARCH_RESULTS_LIMIT} search "
-                f"results: all of them share {self.replication_key}={last_value}."
-            )
-            raise RuntimeError(msg)
+        if after and int(after) + SEARCH_PAGE_SIZE < SEARCH_RESULTS_LIMIT:
+            return {**token, "after": after}
 
+        if not after:
+            if token["phase"] == "tie":
+                # All records sharing the tie value were read, resume after it
+                return _search_token("key", value=token["value"], strict=True)
+            return None
+
+        last = response.json()["results"][-1]
+        if token["phase"] == "key":
+            next_token = _search_token(
+                "tie",
+                value=self._get_record_replication_ms(last),
+            )
+        else:
+            next_token = {**token, "last_id": int(last["id"]), "after": None}
         self.logger.info(
-            "Reached the %d search results cap for %s, restarting from %s=%s",
+            "Reached the %d search results cap for %s, continuing with %s",
             SEARCH_RESULTS_LIMIT,
             self.name,
-            self.replication_key,
-            last_value,
+            next_token,
         )
-        return {"after": None, "since": next_since}
+        return next_token
 
     def post_process(
         self,
@@ -363,36 +392,58 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
         if not self._use_search:
             return None
 
-        token = next_page_token if isinstance(next_page_token, dict) else {}
-        since = token.get("since")
-        if since is None:
-            since = self._get_search_start_ms(context)
+        if isinstance(next_page_token, dict):
+            token = next_page_token
+        else:
+            token = self._initial_search_token = self._initial_token(context)
 
-        body = {
-            "filterGroups": [
-                {
-                    "filters": [
-                        {
-                            "propertyName": self.replication_key,
-                            "operator": "GTE",
-                            # Timestamps need to be in milliseconds
-                            # https://legacydocs.hubspot.com/docs/faq/how-should-timestamps-be-formatted-for-hubspots-apis
-                            "value": str(since),
-                        },
-                    ],
-                },
-            ],
-            "sorts": [
-                {
-                    # This is inside the properties object
-                    "propertyName": self.replication_key,
-                    "direction": "ASCENDING",
-                },
-            ],
+        filters = []
+        if token["phase"] == "id":
+            sort_by = "hs_object_id"
+        elif token["phase"] == "key":
+            operator = "GT" if token["strict"] else "GTE"
+            filters.append(_filter(self.replication_key, operator, token["value"]))
+            sort_by = self.replication_key
+        else:
+            filters.append(_filter(self.replication_key, "EQ", token["value"]))
+            sort_by = "hs_object_id"
+        if token["last_id"] is not None:
+            filters.append(_filter("hs_object_id", "GT", token["last_id"]))
+
+        body: dict[str, t.Any] = {
+            # This is inside the properties object
+            "sorts": [{"propertyName": sort_by, "direction": "ASCENDING"}],
             # Hubspot sets a limit of most 100 per request. Default is 10
             "limit": SEARCH_PAGE_SIZE,
             "properties": list(self.hs_properties),
         }
-        if token.get("after"):
+        if filters:
+            body["filterGroups"] = [{"filters": filters}]
+        if token["after"]:
             body["after"] = token["after"]
         return body
+
+
+def _search_token(
+    phase: t.Literal["id", "key", "tie"],
+    *,
+    value: int | None = None,
+    strict: bool = False,
+) -> SearchToken:
+    return {
+        "phase": phase,
+        "value": value,
+        "last_id": None,
+        "strict": strict,
+        "after": None,
+    }
+
+
+def _filter(property_name: str | None, operator: str, value: int) -> dict:
+    return {
+        "propertyName": property_name,
+        "operator": operator,
+        # Timestamps need to be in milliseconds
+        # https://legacydocs.hubspot.com/docs/faq/how-should-timestamps-be-formatted-for-hubspots-apis
+        "value": str(value),
+    }

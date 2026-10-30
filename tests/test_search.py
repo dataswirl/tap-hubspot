@@ -36,30 +36,64 @@ def _props_response(request, context):
     }
 
 
-def _make_search_callback(timestamps: list[int], replication_key: str):
-    """Emulate HubSpot search: GTE filter, ASC sort, `after` offset, 10k cap."""
+def _matches(record: tuple[int, int | None], flt: dict, replication_key: str) -> bool:
+    record_id, ts = record
+    if flt["propertyName"] == "hs_object_id":
+        value = record_id
+    else:
+        assert flt["propertyName"] == replication_key
+        value = ts
+    if value is None:
+        return False
+    target = int(flt["value"])
+    return {
+        "GT": value > target,
+        "GTE": value >= target,
+        "EQ": value == target,
+    }[flt["operator"]]
+
+
+def _make_search_callback(timestamps: list[int | None], replication_key: str):
+    """Emulate HubSpot search: AND filters, one ASC sort, `after` offset, 10k cap.
+
+    Record ids are 1-based positions in `timestamps`, a `None` timestamp means the
+    replication key is empty. Ties on the replication key come back in descending
+    id order, since HubSpot does not guarantee any order for them.
+    """
+    records = [(i + 1, ts) for i, ts in enumerate(timestamps)]
 
     def callback(request, context):
         body = request.json()
-        flt = body["filterGroups"][0]["filters"][0]
-        assert flt["propertyName"] == replication_key
-        assert flt["operator"] == "GTE"
-        since = int(flt["value"])
+        groups = body.get("filterGroups", [])
+        assert len(groups) <= 1
+        filters = groups[0]["filters"] if groups else []
+        (sort,) = body["sorts"]
+        assert sort["direction"] == "ASCENDING"
         after = int(body.get("after", 0))
         if after + body["limit"] > 10000:
             context.status_code = 400
             return {"message": "after exceeds 10000"}
-        matching = [(i, ts) for i, ts in enumerate(timestamps) if ts >= since]
+        matching = [
+            r for r in records if all(_matches(r, f, replication_key) for f in filters)
+        ]
+        if sort["propertyName"] == "hs_object_id":
+            matching.sort(key=lambda r: r[0])
+        else:
+            assert sort["propertyName"] == replication_key
+            assert all(r[1] is not None for r in matching)
+            matching.sort(key=lambda r: (r[1], -r[0]))
         page = matching[after : after + body["limit"]]
         resp = {
             "total": len(matching),
             "results": [
                 {
-                    "id": str(i),
-                    "properties": {replication_key: _iso(ts)},
-                    "updatedAt": _iso(ts),
+                    "id": str(record_id),
+                    "properties": {
+                        replication_key: None if ts is None else _iso(ts),
+                        "hs_object_id": str(record_id),
+                    },
                 }
-                for i, ts in page
+                for record_id, ts in page
             ],
         }
         if after + body["limit"] < len(matching):
@@ -99,19 +133,20 @@ def _sync(stream, capsys) -> list[dict]:
     return [m["record"] for m in messages if m["type"] == "RECORD"]
 
 
-def test_full_sync_without_state_uses_search(http, capsys):
-    """No state and no start_date -> POST /search with epoch-0 filter."""
+def test_full_sync_without_state_scans_by_id(http, capsys):
+    """No state and no start_date -> POST /search sorted by id, no key filter."""
+    timestamps = [BASE_MS + i for i in range(150)]
+    timestamps[10] = timestamps[120] = None
     http.post(
         f"{BASE}/objects/contacts/search",
-        json=_make_search_callback(
-            [BASE_MS + i for i in range(150)], "lastmodifieddate"
-        ),
+        json=_make_search_callback(timestamps, "lastmodifieddate"),
     )
     stream = _tap().streams["contacts"]
 
     records = _sync(stream, capsys)
 
-    assert len(records) == 150
+    # Records with an empty replication key are not dropped
+    assert sorted(int(r["id"]) for r in records) == list(range(1, 151))
     assert not [
         r
         for r in http.request_history
@@ -119,11 +154,80 @@ def test_full_sync_without_state_uses_search(http, capsys):
     ]
     bodies = _search_bodies(http, "/objects/contacts/search")
     assert len(bodies) == 2
-    assert bodies[0]["filterGroups"][0]["filters"][0]["value"] == "0"
+    assert "filterGroups" not in bodies[0]
+    assert bodies[0]["sorts"] == [
+        {"propertyName": "hs_object_id", "direction": "ASCENDING"},
+    ]
     assert "after" not in bodies[0]
     assert bodies[1]["after"] == "100"
     assert len(bodies[0]["properties"]) == N_PROPS + 2
     assert "custom_property_number_0599" in bodies[0]["properties"]
+    assert _parse_ms(stream.get_context_state(None)["replication_key_value"]) == (
+        BASE_MS + 149
+    )
+
+
+def _tap_with_catalog_override(state: dict | None = None, **override) -> TapHubspot:
+    catalog = _tap().catalog_dict
+    (entry,) = [s for s in catalog["streams"] if s["tap_stream_id"] == "contacts"]
+    entry.update(override)
+    return TapHubspot(
+        config={"access_token": "test-token", "start_date": _iso(BASE_MS + 100)},
+        catalog=catalog,
+        state=state,
+        parse_env_config=False,
+        validate_config=False,
+    )
+
+
+def test_full_table_override_ignores_state_and_start_date(http, capsys):
+    http.post(
+        f"{BASE}/objects/contacts/search",
+        json=_make_search_callback(
+            [BASE_MS + i for i in range(150)], "lastmodifieddate"
+        ),
+    )
+    tap = _tap_with_catalog_override(
+        state={
+            "bookmarks": {
+                "contacts": {
+                    "replication_key": "lastmodifieddate",
+                    "replication_key_value": _iso(BASE_MS + 140),
+                },
+            },
+        },
+        replication_method="FULL_TABLE",
+    )
+    stream = tap.streams["contacts"]
+
+    records = _sync(stream, capsys)
+
+    assert len(records) == 150
+    bodies = _search_bodies(http, "/objects/contacts/search")
+    assert all("filterGroups" not in b for b in bodies)
+
+
+def test_cleared_replication_key_scans_by_id(http, capsys):
+    http.post(
+        f"{BASE}/objects/contacts/search",
+        json=_make_search_callback(
+            [BASE_MS + i for i in range(150)], "lastmodifieddate"
+        ),
+    )
+    # Discovery writes `replication_method: INCREMENTAL`, so it is overridden too
+    tap = _tap_with_catalog_override(
+        replication_key=None,
+        replication_method="FULL_TABLE",
+    )
+    stream = tap.streams["contacts"]
+
+    records = _sync(stream, capsys)
+
+    assert len(records) == 150
+    assert all(r.method == "POST" for r in http.request_history if "/objects/" in r.url)
+    bodies = _search_bodies(http, "/objects/contacts/search")
+    assert all("filterGroups" not in b for b in bodies)
+    assert not stream.get_context_state(None).get("replication_key_value")
 
 
 def test_no_long_get_requests_for_any_dynamic_stream(http, capsys):
@@ -210,7 +314,7 @@ def test_existing_state_is_used_as_lower_bound(http, capsys):
     )
 
 
-def test_search_cap_restarts_from_last_seen_value(http, capsys):
+def test_id_scan_cap_restarts_from_last_id(http, capsys):
     timestamps = [BASE_MS + i for i in range(10_500)]
     http.post(
         f"{BASE}/objects/contacts/search",
@@ -225,31 +329,82 @@ def test_search_cap_restarts_from_last_seen_value(http, capsys):
     # 99 pages up to after=9800, then the query restarts without `after`
     assert afters[98] == "9800"
     assert afters[99] is None
-    restart_filter = bodies[99]["filterGroups"][0]["filters"][0]["value"]
-    assert restart_filter == str(timestamps[9899])
+    assert bodies[99]["filterGroups"] == [
+        {
+            "filters": [
+                {"propertyName": "hs_object_id", "operator": "GT", "value": "9900"},
+            ],
+        },
+    ]
     assert all(int(a) < 9900 for a in afters if a)
+    # No duplicates, nothing is missing
+    assert sorted(int(r["id"]) for r in records) == list(range(1, 10_501))
+
+
+def test_key_scan_cap_switches_to_tie_scan(http, capsys):
+    timestamps = [BASE_MS + i for i in range(10_500)]
+    http.post(
+        f"{BASE}/objects/contacts/search",
+        json=_make_search_callback(timestamps, "lastmodifieddate"),
+    )
+    stream = _tap(start_date=_iso(BASE_MS)).streams["contacts"]
+
+    records = _sync(stream, capsys)
+
+    bodies = _search_bodies(http, "/objects/contacts/search")
+    boundary = str(timestamps[9899])
+    tie, resumed = bodies[99], bodies[100]
+    assert tie["filterGroups"][0]["filters"] == [
+        {"propertyName": "lastmodifieddate", "operator": "EQ", "value": boundary},
+    ]
+    assert tie["sorts"][0]["propertyName"] == "hs_object_id"
+    assert "after" not in tie
+    assert resumed["filterGroups"][0]["filters"] == [
+        {"propertyName": "lastmodifieddate", "operator": "GT", "value": boundary},
+    ]
+    assert resumed["sorts"][0]["propertyName"] == "lastmodifieddate"
     # Boundary record is emitted twice, nothing is missing
     assert len(records) == 10_501
-    assert {r["id"] for r in records} == {str(i) for i in range(10_500)}
+    assert {r["id"] for r in records} == {str(i) for i in range(1, 10_501)}
     assert (
         _parse_ms(stream.get_context_state(None)["replication_key_value"])
         == timestamps[-1]
     )
 
 
-def test_search_cap_with_identical_boundary_value_raises(http, capsys):
+def test_search_cap_with_identical_boundary_value_completes(http, capsys):
     http.post(
         f"{BASE}/objects/contacts/search",
         json=_make_search_callback([BASE_MS] * 10_500, "lastmodifieddate"),
     )
+    stream = _tap(start_date=_iso(BASE_MS)).streams["contacts"]
+
+    records = _sync(stream, capsys)
+
+    bodies = _search_bodies(http, "/objects/contacts/search")
+    # key scan (99 pages), tie scan (99 pages), tie restart past id 9900
+    # (6 pages), then the key scan resumes after the tie value (1 empty page)
+    assert len(bodies) == 99 + 99 + 6 + 1
+    assert bodies[198]["filterGroups"][0]["filters"] == [
+        {"propertyName": "lastmodifieddate", "operator": "EQ", "value": str(BASE_MS)},
+        {"propertyName": "hs_object_id", "operator": "GT", "value": "9900"},
+    ]
+    assert bodies[-1]["filterGroups"][0]["filters"][0]["operator"] == "GT"
+    assert {r["id"] for r in records} == {str(i) for i in range(1, 10_501)}
+
+
+def test_paging_next_null_ends_pagination(http, capsys):
+    http.post(
+        f"{BASE}/objects/contacts/search",
+        json={
+            "results": [{"id": "1", "properties": {}}],
+            "paging": {"next": None},
+        },
+    )
     stream = _tap().streams["contacts"]
 
-    with pytest.raises(RuntimeError, match="all of them share lastmodifieddate"):
-        _sync(stream, capsys)
-
-    # First restart moves the filter forward (0 -> BASE_MS), the second one would not.
-    bodies = _search_bodies(http, "/objects/contacts/search")
-    assert len(bodies) == 99 * 2
+    assert len(_sync(stream, capsys)) == 1
+    assert len(_search_bodies(http, "/objects/contacts/search")) == 1
 
 
 def _parse_ms(value: str) -> int:
