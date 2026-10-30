@@ -84,9 +84,9 @@ You can easily run `tap-hubspot` by itself or in a pipeline using [Meltano](http
 
 The following Streams use the v1 (legacy) endpoint in the Hubspot API:
 
-1. [TicketPipeline & DealPipeline](https://legacydocs.hubspot.com/docs/methods/pipelines/pipelines_overview): The v3 endpoint requires a pipeline ID parameter to make calls to the API. Because of this, 
+1. [TicketPipeline & DealPipeline](https://legacydocs.hubspot.com/docs/methods/pipelines/pipelines_overview): The v3 endpoint requires a pipeline ID parameter to make calls to the API. Because of this,
 you are limited to only pulling data for a single pipeline ID from v3, whereas the v1 API allows you to pull from all pipelines.
-2. [EmailSubscriptions](https://legacydocs.hubspot.com/docs/methods/email/email_subscriptions_overview): The v3 endpoint requires you to set a single email address to pull subscription data, whereas 
+2. [EmailSubscriptions](https://legacydocs.hubspot.com/docs/methods/email/email_subscriptions_overview): The v3 endpoint requires you to set a single email address to pull subscription data, whereas
 the v1 endpoint allows you to pull data from all emails.
 
 
@@ -109,8 +109,8 @@ Follow these instructions to contribute to this project.
 ### Initialize your Development Environment
 
 ```bash
-pipx install poetry
-poetry install
+# https://docs.astral.sh/uv/getting-started/installation/
+uv sync
 ```
 
 ### Create and Run Tests
@@ -119,13 +119,21 @@ Create tests within the `tests` subfolder and
   then run:
 
 ```bash
-poetry run pytest
+uv run pytest
 ```
 
-You can also test the `tap-hubspot` CLI interface directly using `poetry run`:
+### Lint, format and type check
 
 ```bash
-poetry run tap-hubspot --help
+uv run ruff check --fix   # lint + import sorting
+uv run ruff format        # formatting
+uv run ty check           # type checking
+```
+
+You can also test the `tap-hubspot` CLI interface directly using `uv run`:
+
+```bash
+uv run tap-hubspot --help
 ```
 
 ### Testing with [Meltano](https://www.meltano.com)
