@@ -5,12 +5,16 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import typing as t
 
 import pytest
 import requests_mock as rm
 
 from tap_hubspot.client import DynamicIncrementalHubspotStream
 from tap_hubspot.tap import TapHubspot
+
+if t.TYPE_CHECKING:
+    from collections.abc import Sequence
 
 BASE = "https://api.hubapi.com/crm/v3"
 N_PROPS = 600
@@ -53,12 +57,18 @@ def _matches(record: tuple[int, int | None], flt: dict, replication_key: str) ->
     }[flt["operator"]]
 
 
-def _make_search_callback(timestamps: list[int | None], replication_key: str):
+def _make_search_callback(
+    timestamps: Sequence[int | None],
+    replication_key: str,
+    *,
+    paging_at_cap: bool = True,
+):
     """Emulate HubSpot search: AND filters, one ASC sort, `after` offset, 10k cap.
 
     Record ids are 1-based positions in `timestamps`, a `None` timestamp means the
     replication key is empty. Ties on the replication key come back in descending
     id order, since HubSpot does not guarantee any order for them.
+    With `paging_at_cap=False`, the page ending at the cap has no `paging`.
     """
     records = [(i + 1, ts) for i, ts in enumerate(timestamps)]
 
@@ -96,7 +106,8 @@ def _make_search_callback(timestamps: list[int | None], replication_key: str):
                 for record_id, ts in page
             ],
         }
-        if after + body["limit"] < len(matching):
+        at_cap = after + body["limit"] >= 10000
+        if after + body["limit"] < len(matching) and (paging_at_cap or not at_cap):
             resp["paging"] = {"next": {"after": str(after + body["limit"])}}
         return resp
 
@@ -135,7 +146,7 @@ def _sync(stream, capsys) -> list[dict]:
 
 def test_full_sync_without_state_scans_by_id(http, capsys):
     """No state and no start_date -> POST /search sorted by id, no key filter."""
-    timestamps = [BASE_MS + i for i in range(150)]
+    timestamps: list[int | None] = [BASE_MS + i for i in range(150)]
     timestamps[10] = timestamps[120] = None
     http.post(
         f"{BASE}/objects/contacts/search",
@@ -145,6 +156,7 @@ def test_full_sync_without_state_scans_by_id(http, capsys):
 
     records = _sync(stream, capsys)
 
+    assert not stream.is_sorted
     # Records with an empty replication key are not dropped
     assert sorted(int(r["id"]) for r in records) == list(range(1, 151))
     assert not [
@@ -326,17 +338,17 @@ def test_id_scan_cap_restarts_from_last_id(http, capsys):
 
     bodies = _search_bodies(http, "/objects/contacts/search")
     afters = [b.get("after") for b in bodies]
-    # 99 pages up to after=9800, then the query restarts without `after`
-    assert afters[98] == "9800"
-    assert afters[99] is None
-    assert bodies[99]["filterGroups"] == [
+    # 100 pages up to after=9900, then the query restarts without `after`
+    assert afters[99] == "9900"
+    assert afters[100] is None
+    assert bodies[100]["filterGroups"] == [
         {
             "filters": [
-                {"propertyName": "hs_object_id", "operator": "GT", "value": "9900"},
+                {"propertyName": "hs_object_id", "operator": "GT", "value": "10000"},
             ],
         },
     ]
-    assert all(int(a) < 9900 for a in afters if a)
+    assert all(int(a) <= 9900 for a in afters if a)
     # No duplicates, nothing is missing
     assert sorted(int(r["id"]) for r in records) == list(range(1, 10_501))
 
@@ -352,8 +364,8 @@ def test_key_scan_cap_switches_to_tie_scan(http, capsys):
     records = _sync(stream, capsys)
 
     bodies = _search_bodies(http, "/objects/contacts/search")
-    boundary = str(timestamps[9899])
-    tie, resumed = bodies[99], bodies[100]
+    boundary = str(timestamps[9999])
+    tie, resumed = bodies[100], bodies[101]
     assert tie["filterGroups"][0]["filters"] == [
         {"propertyName": "lastmodifieddate", "operator": "EQ", "value": boundary},
     ]
@@ -382,12 +394,12 @@ def test_search_cap_with_identical_boundary_value_completes(http, capsys):
     records = _sync(stream, capsys)
 
     bodies = _search_bodies(http, "/objects/contacts/search")
-    # key scan (99 pages), tie scan (99 pages), tie restart past id 9900
-    # (6 pages), then the key scan resumes after the tie value (1 empty page)
-    assert len(bodies) == 99 + 99 + 6 + 1
-    assert bodies[198]["filterGroups"][0]["filters"] == [
+    # key scan (100 pages), tie scan (100 pages), tie restart past id 10000
+    # (5 pages), then the key scan resumes after the tie value (1 empty page)
+    assert len(bodies) == 100 + 100 + 5 + 1
+    assert bodies[200]["filterGroups"][0]["filters"] == [
         {"propertyName": "lastmodifieddate", "operator": "EQ", "value": str(BASE_MS)},
-        {"propertyName": "hs_object_id", "operator": "GT", "value": "9900"},
+        {"propertyName": "hs_object_id", "operator": "GT", "value": "10000"},
     ]
     assert bodies[-1]["filterGroups"][0]["filters"][0]["operator"] == "GT"
     assert {r["id"] for r in records} == {str(i) for i in range(1, 10_501)}
@@ -405,6 +417,51 @@ def test_paging_next_null_ends_pagination(http, capsys):
 
     assert len(_sync(stream, capsys)) == 1
     assert len(_search_bodies(http, "/objects/contacts/search")) == 1
+
+
+@pytest.mark.parametrize("start_date", [None, _iso(BASE_MS)])
+def test_missing_paging_at_cap_continues_with_next_scan(http, capsys, start_date):
+    timestamps = [BASE_MS + i for i in range(10_500)]
+    http.post(
+        f"{BASE}/objects/contacts/search",
+        json=_make_search_callback(timestamps, "lastmodifieddate", paging_at_cap=False),
+    )
+    config = {"start_date": start_date} if start_date else {}
+    stream = _tap(**config).streams["contacts"]
+
+    records = _sync(stream, capsys)
+
+    assert {r["id"] for r in records} == {str(i) for i in range(1, 10_501)}
+
+
+def test_dynamic_stream_requires_incremental_path(http):
+    class NoSearchStream(DynamicIncrementalHubspotStream):
+        name = "contacts"
+
+    with pytest.raises(TypeError, match="incremental_path"):
+        NoSearchStream(_tap())
+
+
+def test_interrupted_key_scan_keeps_resumable_bookmark(http, capsys):
+    timestamps = [BASE_MS + i * 1000 for i in range(500)]
+    search = _make_search_callback(timestamps, "lastmodifieddate")
+
+    def failing_search(request, context):
+        if request.json().get("after") == "200":
+            context.status_code = 400
+            return {"message": "boom"}
+        return search(request, context)
+
+    http.post(f"{BASE}/objects/contacts/search", json=failing_search)
+    stream = _tap(start_date=_iso(BASE_MS)).streams["contacts"]
+
+    with pytest.raises(Exception, match="400"):
+        _sync(stream, capsys)
+
+    assert stream.is_sorted
+    state = stream.get_context_state(None)
+    assert "progress_markers" not in state
+    assert _parse_ms(state["replication_key_value"]) == timestamps[199]
 
 
 def _parse_ms(value: str) -> int:

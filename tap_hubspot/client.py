@@ -135,7 +135,12 @@ def _to_epoch_ms(value: str) -> int:
 
 
 class DynamicHubspotStream(HubspotStream):
-    """DynamicHubspotStream"""
+    """Base for streams whose schema is built from the object's HubSpot properties.
+
+    Only discovers the properties and the schema. Requesting every property as a
+    GET query string fails with HTTP 431, so CRM object streams must use
+    `DynamicIncrementalHubspotStream`, which sends them in a search request body.
+    """
 
     def _get_datatype(self, data_type: str) -> th.JSONTypeHelper:  # noqa: ARG002
         # TODO: consider typing more precisely
@@ -183,29 +188,6 @@ class DynamicHubspotStream(HubspotStream):
         results = resp.json().get("results", [])
         return {prop["name"]: prop["type"] for prop in results}
 
-    def get_url_params(
-        self,
-        context: Context | None,
-        next_page_token: PageToken,
-    ) -> dict[str, t.Any]:
-        """Return a dictionary of values to be used in URL parameterization.
-
-        Note: objects with many properties produce a query string too long for
-        HubSpot (HTTP 431). Streams with an `incremental_path` use the search
-        endpoint instead, see `DynamicIncrementalHubspotStream`.
-
-        Args:
-            context: The stream context.
-            next_page_token: The next page index or value.
-
-        Returns:
-            A dictionary of URL query parameters.
-        """
-        params = super().get_url_params(context, next_page_token)
-        if self.hs_properties:
-            params["properties"] = ",".join(self.hs_properties)
-        return params
-
 
 class DynamicIncrementalHubspotStream(DynamicHubspotStream):
     """Dynamic stream that reads through the object's search endpoint.
@@ -213,6 +195,8 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
     The search endpoint is a POST request that carries the property list in the
     JSON body, so it is used for every sync (incremental or full) to avoid
     HTTP 431 errors caused by long `properties` query strings.
+
+    Subclasses must set `incremental_path` to the object's search endpoint.
 
     Search results are capped at 10k per query and only one sort is allowed, so
     the sync runs as a sequence of scans:
@@ -230,14 +214,36 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
     Pagination tokens are dicts:
     `{"phase": "id" | "key" | "tie", "value": <ms | None>, "last_id": <int | None>,
     "strict": <bool>, "after": <str | None>}`.
+
+    Syncs that start with a `key` scan emit non-decreasing replication key
+    values, so they are treated as sorted and can resume from the bookmark if
+    interrupted. Syncs that start with an `id` scan are unsorted.
     """
 
     incremental_path: str | None = None
     _initial_search_token: SearchToken | None = None
 
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Fail fast (before the properties request) without a search endpoint."""
+        if not self.incremental_path:
+            msg = f"{type(self).__name__} must define incremental_path"
+            raise TypeError(msg)
+        super().__init__(*args, **kwargs)
+
     @property
-    def _use_search(self) -> bool:
-        return bool(self.incremental_path)
+    def is_sorted(self) -> bool:
+        """Return True when the sync started with a `key` scan."""
+        token = self._initial_search_token
+        return token is not None and token["phase"] == "key"
+
+    @property
+    def check_sorted(self) -> bool:
+        """Disable the SDK sort check.
+
+        The SDK compares the replication key values as strings, and HubSpot may
+        omit the milliseconds (`...00Z` sorts after `...00.5Z`).
+        """
+        return False
 
     @property
     def _is_full_table(self) -> bool:
@@ -270,24 +276,6 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
             raise RuntimeError(msg)
         return _to_epoch_ms(value)
 
-    def get_url_params(
-        self,
-        context: Context | None,
-        next_page_token: PageToken,
-    ) -> dict[str, t.Any]:
-        """Return a dictionary of values to be used in URL parameterization.
-
-        Args:
-            context: The stream context.
-            next_page_token: The next page index or value.
-
-        Returns:
-            A dictionary of URL query parameters.
-        """
-        if self._use_search:
-            return {}
-        return super().get_url_params(context, next_page_token)
-
     def get_next_page_token(
         self,
         response: requests.Response,
@@ -295,9 +283,6 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
     ) -> PageToken:
         """Return the next search token, moving to the next scan at the 10k cap."""
         after = self._get_paging_after(response)
-        if not self._use_search:
-            return after
-
         token = (
             previous_token
             if isinstance(previous_token, dict)
@@ -307,16 +292,24 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
             msg = "Search token is missing: no search request was prepared."
             raise RuntimeError(msg)
 
-        if after and int(after) + SEARCH_PAGE_SIZE < SEARCH_RESULTS_LIMIT:
+        if after and int(after) + SEARCH_PAGE_SIZE <= SEARCH_RESULTS_LIMIT:
             return {**token, "after": after}
 
-        if not after:
+        results = response.json().get("results") or []
+        # Do not rely on HubSpot returning `after` for the page ending at the cap:
+        # a full last page means there may be more records past it
+        offset = int(token["after"] or 0)
+        at_cap = bool(after) or (
+            offset + SEARCH_PAGE_SIZE >= SEARCH_RESULTS_LIMIT
+            and len(results) == SEARCH_PAGE_SIZE
+        )
+        if not at_cap:
             if token["phase"] == "tie":
                 # All records sharing the tie value were read, resume after it
                 return _search_token("key", value=token["value"], strict=True)
             return None
 
-        last = response.json()["results"][-1]
+        last = results[-1]
         if token["phase"] == "key":
             next_token = _search_token(
                 "tie",
@@ -364,9 +357,7 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
         context: Context | None,
         next_page_token: PageToken,
     ) -> requests.PreparedRequest:
-        """Prepare a POST request to the search endpoint, or the default request."""
-        if not self._use_search:
-            return super().prepare_request(context, next_page_token)
+        """Prepare a POST request to the search endpoint."""
         # Search endpoints use POST requests
         return self.build_prepared_request(
             method="POST",
@@ -379,7 +370,7 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
         self,
         context: Context | None,
         next_page_token: PageToken,
-    ) -> dict | None:
+    ) -> dict:
         """Prepare the JSON body for the search request.
 
         https://developers.hubspot.com/docs/api/crm/search
@@ -389,9 +380,6 @@ class DynamicIncrementalHubspotStream(DynamicHubspotStream):
             next_page_token: Token, page number or any request argument to request the
                 next page of data.
         """
-        if not self._use_search:
-            return None
-
         if isinstance(next_page_token, dict):
             token = next_page_token
         else:
