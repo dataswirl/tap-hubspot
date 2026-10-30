@@ -7,7 +7,8 @@ class HubSpotOAuthAuthenticator(OAuthAuthenticator, metaclass=SingletonMeta):
     """Authenticator class for HubSpot."""
 
     @property
-    def oauth_request_body(self):
+    def oauth_request_body(self) -> dict:
+        """Return the request body for refreshing the access token."""
         return {
             "grant_type": "refresh_token",
             "client_id": self.config["client_id"],

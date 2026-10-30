@@ -1,66 +1,82 @@
-[tool.poetry]
+[project]
 name = "meltano-tap-hubspot"
-version = "0.0.0"
+dynamic = ["version"]
 description = "`tap-hubspot` is a Singer tap for tap-hubspot, built with the Meltano Singer SDK."
 readme = "README.md"
-authors = ["Ethan Stein"]
+authors = [{ name = "Ethan Stein" }]
 keywords = [
     "ELT",
     "tap-hubspot",
 ]
 license = "Apache-2.0"
-packages = [
-    { include = "tap_hubspot" },
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.3,<3",
+    "singer-sdk>=0.41.0,<0.42",
 ]
 
-[tool.poetry.dependencies]
-python = "<3.13,>=3.8"
-backports-datetime-fromisoformat = {version = "^2.0.2", python = "<3.11"}
-fs-s3fs = { version = "^1.1.1", optional = true }
-requests = "^2.32.3"
-singer-sdk = { version="^0.41.0" }
+[project.optional-dependencies]
+s3 = ["fs-s3fs>=1.1.1,<2"]
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^7.4.4"
-singer-sdk = { version="^0.41.0", extras = ["testing"] }
+[project.scripts]
+# CLI declaration
+tap-hubspot = "tap_hubspot.tap:TapHubspot.cli"
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3 # Vertical Hanging Indent
-src_paths = "tap_hubspot"
-
-[tool.poetry.extras]
-s3 = ["fs-s3fs"]
-
-[tool.mypy]
-python_version = "3.9"
-warn_unused_configs = true
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "requests-mock>=1.12.1,<2",
+    "ruff>=0.17.3",
+    "singer-sdk[testing]>=0.41.0,<0.42",
+    "ty>=0.0.95",
+]
 
 [tool.ruff]
-ignore = [
-    "ANN101",  # missing-type-self
-    "ANN102",  # missing-type-cls
-]
-select = ["ALL"]
-src = ["tap_hubspot"]
-target-version = "py37"
+src = ["tap_hubspot", "tests"]
+target-version = "py312"
 
-[tool.ruff.flake8-annotations]
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",  # conflicts with the formatter
+    "CPY001",  # no copyright headers
+    "D415",    # docstring punctuation
+    "FIX002",  # TODOs are allowed
+    "TD002",   # TODO author
+    "TD003",   # TODO issue link
+    "RUF012",  # singer-sdk declares stream attributes as mutable class defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "ANN",      # type annotations
+    "ARG",      # unused arguments (mock callbacks)
+    "D103",     # docstrings on test functions
+    "PLR2004",  # magic values
+    "S101",     # assert
+    "S105",     # dummy credentials
+]
+
+[tool.ruff.lint.flake8-annotations]
 allow-star-arg-any = true
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["tap_hubspot"]
 
-[tool.ruff.pydocstyle]
+[tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ty.environment]
+python-version = "3.12"
+
 [build-system]
-requires = ["poetry-core==1.8.1", "poetry-dynamic-versioning==1.2.0"]
-build-backend = "poetry_dynamic_versioning.backend"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
 
-[tool.poetry.scripts]
-# CLI declaration
-tap-hubspot = 'tap_hubspot.tap:TapHubspot.cli'
+[tool.hatch.version]
+source = "vcs"
+# Used when building outside a git checkout (e.g. a source archive)
+fallback-version = "0.0.0"
 
-[tool.poetry-dynamic-versioning]
-enable = true
+[tool.hatch.build.targets.wheel]
+packages = ["tap_hubspot"]
