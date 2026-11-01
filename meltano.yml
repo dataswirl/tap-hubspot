@@ -4,23 +4,23 @@ project_id: "tap-hubspot"
 default_environment: dev
 plugins:
   extractors:
-  - name: "tap-hubspot"
-    namespace: "tap_hubspot"
-    pip_url: -e .
-    capabilities:
-    - state
-    - catalog
-    - discover
-    - about
-    - stream-maps
-    settings:
-    - name: access_token
-      kind: password
-    - name: start_date
-      value: '2023-01-01T00:00:00Z'
-    - name: end_date
-      value: '2023-05-22T00:00:00Z'
+    - name: "tap-hubspot"
+      namespace: "tap_hubspot"
+      pip_url: -e .
+      capabilities:
+        - state
+        - catalog
+        - discover
+        - about
+        - stream-maps
+      settings:
+        - name: access_token
+          kind: password
+        - name: start_date
+          value: '2023-01-01T00:00:00Z'
+        - name: end_date
+          value: '2023-05-22T00:00:00Z'
 environments:
-- name: dev
-- name: staging
-- name: prod
+  - name: dev
+  - name: staging
+  - name: prod

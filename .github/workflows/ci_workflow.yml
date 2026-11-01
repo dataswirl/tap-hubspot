@@ -1,38 +1,28 @@
 ### A CI workflow template that runs linting and python testing
-
 name: Test tap-hubspot
-
 on: [push]
-
 jobs:
   linting:
-
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
-
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    - name: Install uv and Python ${{ matrix.python-version }}
-      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        uv sync --locked
-    - name: Lint and sort imports
-      run: |
-        uv run ruff check --output-format github
-    - name: Check formatting
-      run: |
-        uv run ruff format --check
-    - name: Type check
-      run: |
-        uv run ty check --output-format github
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12" # lowest supported; matches ruff/ty targets
+      - name: Install dependencies
+        run: |
+          uv sync --locked
+      - name: Lint and sort imports
+        run: |
+          uv run ruff check --output-format github
+      - name: Check formatting
+        run: |
+          uv run ruff format --check
+      - name: Type check
+        run: |
+          uv run ty check --output-format github
   pytest:
-
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
@@ -40,22 +30,21 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Install uv and Python ${{ matrix.python-version }}
-      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        uv sync --locked
-    - name: Test with pytest
-      id: test_pytest
-      continue-on-error: false
-      env:
-        TAP_HUBSPOT_CLIENT_ID: ${{secrets.TAP_HUBSPOT_CLIENT_ID}}
-        TAP_HUBSPOT_CLIENT_SECRET: ${{secrets.TAP_HUBSPOT_CLIENT_SECRET}}
-        TAP_HUBSPOT_REFRESH_TOKEN: ${{secrets.TAP_HUBSPOT_REFRESH_TOKEN}}
-      run: |
-        uv run pytest --capture=no
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          uv sync --locked
+      - name: Test with pytest
+        id: test_pytest
+        continue-on-error: false
+        env:
+          TAP_HUBSPOT_CLIENT_ID: ${{secrets.TAP_HUBSPOT_CLIENT_ID}}
+          TAP_HUBSPOT_CLIENT_SECRET: ${{secrets.TAP_HUBSPOT_CLIENT_SECRET}}
+          TAP_HUBSPOT_REFRESH_TOKEN: ${{secrets.TAP_HUBSPOT_REFRESH_TOKEN}}
+        run: |
+          uv run pytest --capture=no

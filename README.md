@@ -130,6 +130,13 @@ uv run ruff format        # formatting
 uv run ty check           # type checking
 ```
 
+The same checks run as [pre-commit](https://pre-commit.com) hooks. Install them once with:
+
+```bash
+uvx pre-commit install
+uvx pre-commit run --all-files  # optional: run all hooks against the whole repo
+```
+
 You can also test the `tap-hubspot` CLI interface directly using `uv run`:
 
 ```bash

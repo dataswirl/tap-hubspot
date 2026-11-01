@@ -1,31 +1,33 @@
-ci:
-  autofix_prs: true
-  autoupdate_schedule: weekly
-  autoupdate_commit_msg: 'chore: pre-commit autoupdate'
-  skip: [ty]  # needs the uv environment
-
 repos:
-- repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v4.4.0
-  hooks:
-  - id: check-json
-  - id: check-toml
-  - id: check-yaml
-  - id: end-of-file-fixer
-  - id: trailing-whitespace
-
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.17.3
-  hooks:
-  - id: ruff-check
-    args: [--fix, --exit-non-zero-on-fix]
-  - id: ruff-format
-
-- repo: local
-  hooks:
-  - id: ty
-    name: ty
-    entry: uv run ty check
-    language: system
-    types: [python]
-    pass_filenames: false
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.21.0
+    hooks:
+      - id: yamlfmt
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ty
+        name: ty check
+        entry: uv run --frozen ty check
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
